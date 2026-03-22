@@ -18,6 +18,35 @@ A self-hosted PDF OCR API powered by [PaddleOCR](https://github.com/PaddlePaddle
 
 ## Quick start
 
+**Using Docker Hub image:**
+
+```yaml
+services:
+  paddleocr:
+    image: edgaras0x4e/paddleocr-pdf-api:latest
+    ports:
+      - "8099:8000"
+    volumes:
+      - ocr-data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  ocr-data:
+```
+
+```bash
+docker compose up -d
+```
+
+**Or build from source:**
+
 ```bash
 git clone https://github.com/Edgaras0x4E/paddleocr-pdf-api.git && cd paddleocr-pdf-api
 docker compose up --build -d
