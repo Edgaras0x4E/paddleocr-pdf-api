@@ -10,6 +10,7 @@ A self-hosted PDF OCR API powered by [PaddleOCR](https://github.com/PaddlePaddle
 | **Parameters** | 0.9B |
 | **Layout detection** | PP-DocLayoutV3 |
 | **GPU VRAM** | ~8.5GB |
+| **Input formats** | PDF, PNG, JPG, JPEG, BMP, TIFF, WEBP |
 
 ## Requirements
 
@@ -57,6 +58,8 @@ The API will be available at `http://localhost:8099`. On first startup the model
 ## Usage
 
 ### Submit a PDF
+
+Also accepts single image files as a bonus: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff`, `.webp` (processed as a 1-page job).
 
 ```bash
 curl -X POST http://localhost:8099/ocr -F "file=@document.pdf"
@@ -189,6 +192,43 @@ Environment variables set in `docker-compose.yml`:
 | `DB_PATH` | `/data/ocr.db` | SQLite database path |
 | `UPLOAD_DIR` | `/data/uploads` | Upload storage path |
 
+### Image descriptions (optional)
+
+When enabled, cropped image regions (photos, charts, seals, logos) detected by the layout model are sent to an OpenAI-compatible vision model, and the returned description is inlined in the page markdown as a `> **[Label]** ...` blockquote. Disabled by default - the original behavior (stripping image tags) is preserved.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IMAGE_DESCRIPTION_ENABLED` | `false` | Master switch. When `false`, images are stripped as before. |
+| `IMAGE_DESCRIPTION_PROVIDER` | `openai` | `openai` (any `OpenAI(base_url=…)`-compatible endpoint) or `azure` (uses `AzureOpenAI`). |
+| `IMAGE_DESCRIPTION_API_URL` | `https://api.openai.com/v1` | Base URL. For `azure`, the resource endpoint, e.g. `https://<name>.cognitiveservices.azure.com`. |
+| `IMAGE_DESCRIPTION_API_KEY` | _(empty)_ | Bearer / API key. Local backends accept any placeholder. |
+| `IMAGE_DESCRIPTION_API_VERSION` | _(empty)_ | Azure-only, e.g. `2025-01-01-preview` (chat) or `2025-04-01-preview` (responses). |
+| `IMAGE_DESCRIPTION_API_MODE` | `chat_completions` | `chat_completions` (universal) or `responses` (OpenAI-native / Azure). |
+| `IMAGE_DESCRIPTION_MODEL` | `gpt-5.4` | Model name (or Azure deployment name). |
+| `IMAGE_DESCRIPTION_PROMPT` | _built-in neutral prompt_ | Default prompt used when no per-label override is set. |
+| `IMAGE_DESCRIPTION_PROMPT_<LABEL>` | _(empty)_ | Per-label override, e.g. `IMAGE_DESCRIPTION_PROMPT_CHART="Extract numeric data as a markdown table."`. Label is the uppercase `block_label` (`IMAGE`, `CHART`, `SEAL`, `HEADER_IMAGE`, `FOOTER_IMAGE`). |
+| `IMAGE_DESCRIPTION_LABELS` | `image,chart,seal,header_image,footer_image` | Comma-separated labels to describe. `table` and `formula` are always skipped (PaddleOCR renders them natively). |
+| `IMAGE_DESCRIPTION_MIN_PIXELS` | `10000` | Skip crops smaller than this area (w × h). Filters out bullet icons. |
+| `IMAGE_DESCRIPTION_MAX_EDGE_PX` | `1568` | Downscale longest edge before sending. `0` disables. |
+| `IMAGE_DESCRIPTION_MAX_PER_PAGE` | `10` | Cap of described images per page. |
+| `IMAGE_DESCRIPTION_TIMEOUT` | `60` | Seconds per request. |
+| `IMAGE_DESCRIPTION_MAX_RETRIES` | `2` | Retries on transient errors. |
+| `IMAGE_DESCRIPTION_ON_ERROR` | `skip` | `skip`, `placeholder` (inserts `[image description unavailable]`), or `fail`. |
+
+Example `docker-compose.yml` override:
+
+```yaml
+environment:
+  - IMAGE_DESCRIPTION_ENABLED=true
+  - IMAGE_DESCRIPTION_PROVIDER=azure
+  - IMAGE_DESCRIPTION_API_URL="https://<your-resource>.cognitiveservices.azure.com"
+  - IMAGE_DESCRIPTION_API_VERSION="2025-04-01-preview"
+  - IMAGE_DESCRIPTION_API_MODE=responses
+  - IMAGE_DESCRIPTION_MODEL="gpt-5.4"
+  - IMAGE_DESCRIPTION_API_KEY="<your-key>"
+  - IMAGE_DESCRIPTION_PROMPT_CHART="Extract all data points from this chart as a markdown table."
+```
+
 ### Enabling API key authentication
 
 Uncomment the environment section in `docker-compose.yml`:
@@ -252,3 +292,11 @@ The `/data` volume stores the SQLite database and uploaded PDFs. This is a named
 ## License
 
 MIT
+
+## Changelog
+
+### v0.2.0
+
+- Accept single image uploads (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff`, `.webp`) as 1-page jobs.
+- Optional image descriptions via OpenAI / Azure OpenAI models.
+- Fixed tables to markdown tables.

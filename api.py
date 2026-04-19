@@ -1,3 +1,5 @@
+import base64
+import io
 import os
 import re
 import sqlite3
@@ -13,12 +15,253 @@ import pypdfium2 as pdfium
 import uvicorn
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from paddleocr import PaddleOCRVL
+from PIL import Image
+
+
+ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+ALLOWED_IMAGE_MIMES = {
+    "image/png", "image/jpeg", "image/bmp", "image/x-ms-bmp",
+    "image/tiff", "image/webp",
+}
 
 
 DB_PATH = os.environ.get("DB_PATH", "/data/ocr.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/uploads")
 DPI = int(os.environ.get("OCR_DPI", "200"))
 API_KEY = os.environ.get("API_KEY", "")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+IMAGE_DESCRIPTION_ENABLED = _env_bool("IMAGE_DESCRIPTION_ENABLED", False)
+IMAGE_DESCRIPTION_PROVIDER = os.environ.get("IMAGE_DESCRIPTION_PROVIDER", "openai").lower()
+IMAGE_DESCRIPTION_API_URL = os.environ.get("IMAGE_DESCRIPTION_API_URL", "https://api.openai.com/v1")
+IMAGE_DESCRIPTION_API_KEY = os.environ.get("IMAGE_DESCRIPTION_API_KEY", "")
+IMAGE_DESCRIPTION_API_VERSION = os.environ.get("IMAGE_DESCRIPTION_API_VERSION", "")
+IMAGE_DESCRIPTION_API_MODE = os.environ.get("IMAGE_DESCRIPTION_API_MODE", "chat_completions").lower()
+IMAGE_DESCRIPTION_MODEL = os.environ.get("IMAGE_DESCRIPTION_MODEL", "gpt-5.4")
+IMAGE_DESCRIPTION_DEFAULT_PROMPT = os.environ.get(
+    "IMAGE_DESCRIPTION_PROMPT",
+    "Describe this image from a document concisely. Focus on content relevant to "
+    "understanding the document (what's shown, any text, data, or diagram meaning). "
+    "Do not speculate.",
+)
+IMAGE_DESCRIPTION_LABELS = {
+    lbl.strip().lower()
+    for lbl in os.environ.get(
+        "IMAGE_DESCRIPTION_LABELS",
+        "image,chart,seal,header_image,footer_image",
+    ).split(",")
+    if lbl.strip()
+}
+IMAGE_DESCRIPTION_MIN_PIXELS = int(os.environ.get("IMAGE_DESCRIPTION_MIN_PIXELS", "10000"))
+IMAGE_DESCRIPTION_MAX_EDGE_PX = int(os.environ.get("IMAGE_DESCRIPTION_MAX_EDGE_PX", "1568"))
+IMAGE_DESCRIPTION_MAX_PER_PAGE = int(os.environ.get("IMAGE_DESCRIPTION_MAX_PER_PAGE", "10"))
+IMAGE_DESCRIPTION_TIMEOUT = int(os.environ.get("IMAGE_DESCRIPTION_TIMEOUT", "60"))
+IMAGE_DESCRIPTION_MAX_RETRIES = int(os.environ.get("IMAGE_DESCRIPTION_MAX_RETRIES", "2"))
+IMAGE_DESCRIPTION_ON_ERROR = os.environ.get("IMAGE_DESCRIPTION_ON_ERROR", "skip").lower()
+
+IMAGE_DESCRIPTION_PROMPT_OVERRIDES = {
+    key[len("IMAGE_DESCRIPTION_PROMPT_"):].lower(): val
+    for key, val in os.environ.items()
+    if key.startswith("IMAGE_DESCRIPTION_PROMPT_") and val
+}
+
+NATIVE_RENDERED_LABELS = {"table", "formula"}
+
+_IMG_PATH_RE = re.compile(r"img_in_(?P<label>[a-z_]+?)_box_(\d+)_(\d+)_(\d+)_(\d+)")
+_HTML_IMG_RE = re.compile(r'<img\s+[^>]*src="(?P<src>[^"]+)"[^>]*/?>', re.IGNORECASE)
+_MD_IMG_RE = re.compile(r'!\[[^\]]*\]\((?P<src>[^)]+)\)')
+
+
+_vision_client = None
+_vision_client_lock = threading.Lock()
+
+
+def _build_vision_client():
+    from openai import AzureOpenAI, OpenAI
+
+    if IMAGE_DESCRIPTION_PROVIDER == "azure":
+        return AzureOpenAI(
+            azure_endpoint=IMAGE_DESCRIPTION_API_URL,
+            api_key=IMAGE_DESCRIPTION_API_KEY or "none",
+            api_version=IMAGE_DESCRIPTION_API_VERSION,
+            timeout=IMAGE_DESCRIPTION_TIMEOUT,
+        )
+    return OpenAI(
+        base_url=IMAGE_DESCRIPTION_API_URL,
+        api_key=IMAGE_DESCRIPTION_API_KEY or "none",
+        timeout=IMAGE_DESCRIPTION_TIMEOUT,
+    )
+
+
+def _get_vision_client():
+    global _vision_client
+    if _vision_client is None:
+        with _vision_client_lock:
+            if _vision_client is None:
+                _vision_client = _build_vision_client()
+    return _vision_client
+
+
+def _parse_image_path(path: str):
+    name = os.path.basename(path)
+    m = _IMG_PATH_RE.search(name)
+    if not m:
+        return None
+    label = m.group("label").lower()
+    x1, y1, x2, y2 = (int(m.group(i)) for i in (2, 3, 4, 5))
+    return label, (x1, y1, x2, y2)
+
+
+def _prompt_for(label: str) -> str:
+    return IMAGE_DESCRIPTION_PROMPT_OVERRIDES.get(label.lower(), IMAGE_DESCRIPTION_DEFAULT_PROMPT)
+
+
+def _encode_image(pil_image) -> str:
+    img = pil_image
+    if IMAGE_DESCRIPTION_MAX_EDGE_PX > 0 and max(img.size) > IMAGE_DESCRIPTION_MAX_EDGE_PX:
+        img = img.copy()
+        img.thumbnail((IMAGE_DESCRIPTION_MAX_EDGE_PX, IMAGE_DESCRIPTION_MAX_EDGE_PX))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _vision_call(client, data_url: str, prompt: str) -> str:
+    if IMAGE_DESCRIPTION_API_MODE == "responses":
+        resp = client.responses.create(
+            model=IMAGE_DESCRIPTION_MODEL,
+            input=[{"role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url},
+            ]}],
+            timeout=IMAGE_DESCRIPTION_TIMEOUT,
+        )
+        return (resp.output_text or "").strip()
+    resp = client.chat.completions.create(
+        model=IMAGE_DESCRIPTION_MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+        timeout=IMAGE_DESCRIPTION_TIMEOUT,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _describe_one(client, pil_image, prompt: str) -> str:
+    data_url = _encode_image(pil_image)
+    last_err = None
+    for attempt in range(IMAGE_DESCRIPTION_MAX_RETRIES + 1):
+        try:
+            return _vision_call(client, data_url, prompt)
+        except Exception as e:
+            last_err = e
+            if attempt < IMAGE_DESCRIPTION_MAX_RETRIES:
+                time.sleep(min(2 ** attempt, 5))
+    raise last_err
+
+
+def _replace_image_tags(text: str, replacements: dict) -> str:
+    def _sub(match):
+        src = match.group("src")
+        key = _match_replacement_key(src, replacements)
+        if key is None:
+            return ""
+        return replacements[key]
+
+    text = _HTML_IMG_RE.sub(_sub, text)
+    text = _MD_IMG_RE.sub(_sub, text)
+    text = re.sub(r'<div[^>]*>\s*</div>', "", text)
+    text = re.sub(r'\n{3,}', "\n\n", text)
+    return text
+
+
+def _match_replacement_key(src: str, replacements: dict):
+    if src in replacements:
+        return src
+    base = os.path.basename(src)
+    for key in replacements:
+        if os.path.basename(key) == base:
+            return key
+    return None
+
+
+def describe_images(text: str, images: dict, page_num: int = 0, job_id: str = "") -> str:
+    if not text or not images:
+        return strip_image_tags(text)
+
+    referenced = set()
+    for m in _HTML_IMG_RE.finditer(text):
+        referenced.add(m.group("src"))
+    for m in _MD_IMG_RE.finditer(text):
+        referenced.add(m.group("src"))
+
+    client = None
+    replacements: dict = {}
+    described = 0
+
+    for path, pil_image in images.items():
+        if path not in referenced:
+            base = os.path.basename(path)
+            if not any(os.path.basename(r) == base for r in referenced):
+                continue
+
+        parsed = _parse_image_path(path)
+        if parsed is None:
+            replacements[path] = ""
+            continue
+        label, (x1, y1, x2, y2) = parsed
+
+        if label in NATIVE_RENDERED_LABELS:
+            continue
+        if label not in IMAGE_DESCRIPTION_LABELS:
+            replacements[path] = ""
+            continue
+
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        if area < IMAGE_DESCRIPTION_MIN_PIXELS:
+            replacements[path] = ""
+            continue
+
+        if described >= IMAGE_DESCRIPTION_MAX_PER_PAGE:
+            replacements[path] = ""
+            continue
+
+        if client is None:
+            client = _get_vision_client()
+
+        prompt = _prompt_for(label)
+        label_display = label.replace("_", " ").title()
+
+        try:
+            desc = _describe_one(client, pil_image, prompt)
+        except Exception as e:
+            print(f"[image-desc] job={job_id[:8]} page={page_num} label={label} error: {e}")
+            if IMAGE_DESCRIPTION_ON_ERROR == "fail":
+                raise
+            if IMAGE_DESCRIPTION_ON_ERROR == "placeholder":
+                replacements[path] = f"> **[{label_display}]** [image description unavailable]"
+            else:
+                replacements[path] = ""
+            continue
+
+        if not desc:
+            replacements[path] = ""
+            continue
+
+        replacements[path] = f"> **[{label_display}]** {desc}"
+        described += 1
+
+    return _replace_image_tags(text, replacements)
 
 
 def verify_api_key(request: Request):
@@ -72,6 +315,40 @@ def get_db():
     finally:
         conn.close()
 
+
+
+_TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.DOTALL | re.IGNORECASE)
+_TR_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+_CELL_RE = re.compile(r"<(th|td)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+
+
+def _cell_text(raw: str) -> str:
+    raw = re.sub(r"<br\s*/?>", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = raw.replace("|", r"\|")
+    return " ".join(raw.split())
+
+
+def _table_to_markdown(inner_html: str) -> str:
+    rows = []
+    for tr in _TR_RE.finditer(inner_html):
+        cells = [_cell_text(m.group(2)) for m in _CELL_RE.finditer(tr.group(1))]
+        if cells and any(c for c in cells):
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    header, body = rows[0], rows[1:]
+    lines = ["| " + " | ".join(header) + " |",
+             "| " + " | ".join(["---"] * width) + " |"]
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+def convert_html_tables(text: str) -> str:
+    return _TABLE_RE.sub(lambda m: "\n\n" + _table_to_markdown(m.group(1)) + "\n\n", text)
 
 
 def strip_html(text: str) -> str:
@@ -143,11 +420,20 @@ class OCRWorker:
 
     def _process_job(self, ocr, job):
         job_id = job["id"]
-        pdf_path = Path(UPLOAD_DIR) / job_id / "input.pdf"
+        job_dir = Path(UPLOAD_DIR) / job_id
+        input_candidates = list(job_dir.glob("input.*"))
+        if not input_candidates:
+            raise FileNotFoundError(f"no input file in {job_dir}")
+        input_path = input_candidates[0]
+        is_pdf = input_path.suffix.lower() == ".pdf"
 
         try:
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            total_pages = len(pdf)
+            if is_pdf:
+                pdf = pdfium.PdfDocument(str(input_path))
+                total_pages = len(pdf)
+            else:
+                pdf = None
+                total_pages = 1
 
             with get_db() as db:
                 db.execute(
@@ -169,9 +455,14 @@ class OCRWorker:
                     print(f"[{job_id[:8]}] Job cancelled at page {page_idx + 1}/{total_pages}")
                     return
 
-                page = pdf[page_idx]
-                bitmap = page.render(scale=scale)
-                pil_image = bitmap.to_pil()
+                if is_pdf:
+                    page = pdf[page_idx]
+                    bitmap = page.render(scale=scale)
+                    pil_image = bitmap.to_pil()
+                else:
+                    pil_image = Image.open(input_path)
+                    if pil_image.mode not in ("RGB", "L"):
+                        pil_image = pil_image.convert("RGB")
 
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                     pil_image.save(tmp.name)
@@ -185,15 +476,23 @@ class OCRWorker:
                         md_data = res._to_markdown(pretty=False)
                         if isinstance(md_data, dict):
                             text = md_data.get("markdown_texts") or md_data.get("markdown") or ""
+                            images = md_data.get("markdown_images") or {}
                             if text:
+                                if IMAGE_DESCRIPTION_ENABLED and images:
+                                    text = describe_images(
+                                        text, images,
+                                        page_num=page_idx + 1, job_id=job_id,
+                                    )
+                                else:
+                                    text = strip_image_tags(text)
                                 markdown_parts.append(text)
 
                     if not markdown_parts:
                         markdown_parts = [self._extract_text(result)]
 
                     page_markdown = "\n\n".join(markdown_parts)
+                    page_markdown = convert_html_tables(page_markdown)
                     page_markdown = strip_html(page_markdown)
-                    page_markdown = strip_image_tags(page_markdown)
 
                     now = time.time()
                     with get_db() as db:
@@ -259,20 +558,28 @@ def shutdown():
 
 @app.post("/ocr")
 async def submit_job(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+    suffix = Path(file.filename or "").suffix.lower()
+    is_pdf = suffix == ".pdf"
+    is_image = suffix in ALLOWED_IMAGE_EXTS
+    if not (is_pdf or is_image):
+        raise HTTPException(
+            400,
+            "Only PDF and image files (PNG, JPG, JPEG, BMP, TIFF, WEBP) are supported",
+        )
 
     content = await file.read()
     mime = magic.from_buffer(content, mime=True)
-    if mime != "application/pdf":
+    if is_pdf and mime != "application/pdf":
         raise HTTPException(400, f"File is not a valid PDF (detected: {mime})")
+    if is_image and mime not in ALLOWED_IMAGE_MIMES:
+        raise HTTPException(400, f"File is not a valid image (detected: {mime})")
 
     job_id = uuid.uuid4().hex
     job_dir = Path(UPLOAD_DIR) / job_id
     job_dir.mkdir(parents=True)
 
-    pdf_path = job_dir / "input.pdf"
-    pdf_path.write_bytes(content)
+    input_path = job_dir / f"input{suffix}"
+    input_path.write_bytes(content)
 
     now = time.time()
     with get_db() as db:

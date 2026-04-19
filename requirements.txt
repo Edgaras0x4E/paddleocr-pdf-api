@@ -5,3 +5,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 python-magic
+openai>=1.55

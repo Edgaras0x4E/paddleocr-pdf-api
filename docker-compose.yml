@@ -4,7 +4,15 @@ services:
     ports:
       - "8099:8000"
     # environment:
-    #   - API_KEY=your-secret-key
+    #   - API_KEY="your-secret-key"
+    #   # Image description (optional - disabled by default)
+    #   - IMAGE_DESCRIPTION_ENABLED=true
+    #   - IMAGE_DESCRIPTION_PROVIDER=azure            # openai | azure
+    #   - IMAGE_DESCRIPTION_API_URL="https://<your-resource>.cognitiveservices.azure.com"
+    #   - IMAGE_DESCRIPTION_API_VERSION="2025-04-01-preview"
+    #   - IMAGE_DESCRIPTION_API_MODE=responses        # chat_completions | responses
+    #   - IMAGE_DESCRIPTION_MODEL="gpt-5.4"
+    #   - IMAGE_DESCRIPTION_API_KEY="your-vision-key"
     volumes:
       - ocr-data:/data
     deploy:
