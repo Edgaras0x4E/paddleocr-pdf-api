@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import signal
@@ -106,6 +107,13 @@ def get_job_status(job_id: str):
     }
 
 
+def _page_body(page):
+    body = {"page_num": page["page_num"], "markdown": page["markdown"]}
+    if config.BOUNDING_BOXES:
+        body["bounding_boxes"] = json.loads(page["bounding_boxes"]) if page["bounding_boxes"] else None
+    return body
+
+
 @app.get("/ocr/{job_id}/pages/{page_num}")
 def get_page(job_id: str, page_num: int):
     with db.get_db() as conn:
@@ -123,11 +131,7 @@ def get_page(job_id: str, page_num: int):
             raise HTTPException(404, f"Page {page_num} does not exist (total: {job['total_pages']})")
         raise HTTPException(202, f"Page {page_num} not yet processed")
 
-    return {
-        "job_id": job_id,
-        "page_num": page["page_num"],
-        "markdown": page["markdown"],
-    }
+    return {"job_id": job_id, **_page_body(page)}
 
 
 @app.get("/ocr/{job_id}/result")
@@ -138,7 +142,7 @@ def get_full_result(job_id: str):
             raise HTTPException(404, "Job not found")
 
         pages = conn.execute(
-            db._q("SELECT page_num, markdown FROM pages WHERE job_id = ? ORDER BY page_num"),
+            db._q("SELECT page_num, markdown, bounding_boxes FROM pages WHERE job_id = ? ORDER BY page_num"),
             (job_id,),
         ).fetchall()
 
@@ -148,7 +152,7 @@ def get_full_result(job_id: str):
         "status": job["status"],
         "total_pages": job["total_pages"],
         "processed_pages": job["processed_pages"],
-        "pages": [{"page_num": p["page_num"], "markdown": p["markdown"]} for p in pages],
+        "pages": [_page_body(p) for p in pages],
     }
 
 

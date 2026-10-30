@@ -100,6 +100,9 @@ def _init_db_sqlite():
         cols = [r["name"] for r in db.execute("PRAGMA table_info(jobs)").fetchall()]
         if "cancel_requested" not in cols:
             db.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        page_cols = [r["name"] for r in db.execute("PRAGMA table_info(pages)").fetchall()]
+        if "bounding_boxes" not in page_cols:
+            db.execute("ALTER TABLE pages ADD COLUMN bounding_boxes TEXT")
 
 
 def _init_db_postgres():
@@ -137,6 +140,7 @@ def _init_db_postgres():
         ).fetchone()
         if not exists:
             db.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        db.execute("ALTER TABLE pages ADD COLUMN IF NOT EXISTS bounding_boxes TEXT")
 
 
 def recover_sqlite_jobs():

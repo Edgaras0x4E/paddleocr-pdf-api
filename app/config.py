@@ -39,6 +39,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+BOUNDING_BOXES = _env_bool("OCR_BOUNDING_BOXES", False)
+
 IMAGE_DESCRIPTION_ENABLED = _env_bool("IMAGE_DESCRIPTION_ENABLED", False)
 IMAGE_DESCRIPTION_PROVIDER = os.environ.get("IMAGE_DESCRIPTION_PROVIDER", "openai").lower()
 IMAGE_DESCRIPTION_API_URL = os.environ.get("IMAGE_DESCRIPTION_API_URL", "https://api.openai.com/v1")

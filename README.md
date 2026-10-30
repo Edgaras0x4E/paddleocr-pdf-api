@@ -13,6 +13,7 @@ A self-hosted PDF OCR API powered by [PaddleOCR](https://github.com/PaddlePaddle
   - [Database backend](#database-backend)
   - [Job mode](#job-mode)
   - [Image descriptions](#image-descriptions)
+  - [Bounding boxes](#bounding-boxes)
   - [API key authentication](#api-key-authentication)
 - [Data persistence](#data-persistence)
 - [Changelog](#changelog)
@@ -228,6 +229,7 @@ Environment variables set in `docker-compose.yml`:
 | `OCR_ENGINE` | `vl` | OCR engine: `vl`, `text`, or `structure` (see [OCR engines](#ocr-engines)) |
 | `OCR_DPI` | `200` | DPI for PDF page rendering |
 | `OCR_MARKDOWN_IGNORE_LABELS` | `number, footnote, header, header_image, footer, footer_image, aside_text` | Comma-separated layout labels dropped from the markdown (`vl` and `structure` engines). |
+| `OCR_BOUNDING_BOXES` | `false` | Adds a `bounding_boxes` object to page responses: page size and every detected block's label, pixel box and text (see [Bounding boxes](#bounding-boxes)). |
 | `DATABASE_URL` | _(empty)_ | Empty uses SQLite at `DB_PATH`. A `postgresql://...` URL uses PostgreSQL instead. |
 | `RUN_MODE` | `server` | `server` is the always-on API. `job` reads one file from stdin, processes it, and exits. |
 | `DB_PATH` | `/data/ocr.db` | SQLite database path (used when `DATABASE_URL` is empty) |
@@ -279,12 +281,12 @@ When enabled, cropped image regions (photos, charts, seals, logos) detected by t
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `IMAGE_DESCRIPTION_ENABLED` | `false` | Master switch. When `false`, images are stripped as before. |
-| `IMAGE_DESCRIPTION_PROVIDER` | `openai` | `openai` (any `OpenAI(base_url=…)`-compatible endpoint) or `azure` (uses `AzureOpenAI`). |
+| `IMAGE_DESCRIPTION_PROVIDER` | `openai` | `openai` (any `OpenAI(base_url=…)`-compatible endpoint), `azure` (uses `AzureOpenAI`) or `anthropic` (Claude, uses the `anthropic` SDK; `IMAGE_DESCRIPTION_API_URL` and `IMAGE_DESCRIPTION_API_MODE` are not used). |
 | `IMAGE_DESCRIPTION_API_URL` | `https://api.openai.com/v1` | Base URL. For `azure`, the resource endpoint, e.g. `https://<name>.cognitiveservices.azure.com`. |
 | `IMAGE_DESCRIPTION_API_KEY` | _(empty)_ | Bearer / API key. Local backends accept any placeholder. |
 | `IMAGE_DESCRIPTION_API_VERSION` | _(empty)_ | Azure-only, e.g. `2025-01-01-preview` (chat) or `2025-04-01-preview` (responses). |
 | `IMAGE_DESCRIPTION_API_MODE` | `chat_completions` | `chat_completions` (universal) or `responses` (OpenAI-native / Azure). |
-| `IMAGE_DESCRIPTION_MODEL` | `gpt-5.5` | Model name (or Azure deployment name). |
+| `IMAGE_DESCRIPTION_MODEL` | `gpt-5.5` | Model name (or Azure deployment name). For `anthropic`, for example `claude-opus-5-5`. |
 | `IMAGE_DESCRIPTION_PROMPT` | _built-in neutral prompt_ | Default prompt used when no per-label override is set. |
 | `IMAGE_DESCRIPTION_PROMPT_<LABEL>` | _(empty)_ | Per-label override, e.g. `IMAGE_DESCRIPTION_PROMPT_CHART="Extract numeric data as a markdown table."`. Label is the uppercase `block_label` (`IMAGE`, `CHART`, `SEAL`, `HEADER_IMAGE`, `FOOTER_IMAGE`). |
 | `IMAGE_DESCRIPTION_LABELS` | `image,chart,seal,header_image,footer_image` | Comma-separated labels to describe. `table` and `formula` are always skipped (PaddleOCR renders them natively). |
@@ -307,6 +309,41 @@ environment:
   - IMAGE_DESCRIPTION_MODEL="gpt-5.5"
   - IMAGE_DESCRIPTION_API_KEY="<your-key>"
   - IMAGE_DESCRIPTION_PROMPT_CHART="Extract all data points from this chart as a markdown table."
+```
+
+### Bounding boxes
+
+Set `OCR_BOUNDING_BOXES=true` to get the position of every layout block. Page responses gain a `bounding_boxes` field:
+
+```bash
+curl http://localhost:8099/ocr/{job_id}/pages/1
+```
+
+```json
+{
+  "job_id": "994e7b398bb44d8ab5eade4d2ef57a15",
+  "page_num": 1,
+  "markdown": "## Chapter 1\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit...",
+  "bounding_boxes": {
+    "width": 1654,
+    "height": 2339,
+    "dpi": 200,
+    "blocks": [
+      {"label": "paragraph_title", "bbox": [160, 210, 620, 262], "content": "Chapter 1"},
+      {"label": "text", "bbox": [160, 300, 1490, 980], "content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."},
+      {"label": "table", "bbox": [160, 1040, 1490, 1620], "content": "<table><tr><td>...</td></tr></table>"},
+      {"label": "image", "bbox": [160, 1700, 900, 2200], "content": ""}
+    ]
+  }
+}
+```
+
+`bbox` is the position of the block: `[x1, y1, x2, y2]`. The unit is pixels of the rendered page. `width` and `height` are the size of that page. `dpi` is the resolution of that page. For an image upload, `dpi` is `null`. `content` is the text of the block. For a table, it is HTML. For an image, it is empty. The list includes the blocks that `OCR_MARKDOWN_IGNORE_LABELS` removes from the markdown. For a page processed before you set `OCR_BOUNDING_BOXES`, `bounding_boxes` is `null`.
+
+The `text` engine returns one block for each text line:
+
+```json
+{"label": "text_line", "bbox": [x1, y1, x2, y2], "content": "the text of the line", "score": 0.99}
 ```
 
 ### API key authentication
@@ -335,6 +372,11 @@ curl -H "X-API-Key: your-secret-key" http://localhost:8099/jobs
 The `/data` volume stores the SQLite database and uploaded PDFs. This is a named Docker volume (`ocr-data`) that persists across container restarts and rebuilds. When `DATABASE_URL` points at PostgreSQL, the database lives in PostgreSQL and `/data` only holds uploaded files during processing.
 
 ## Changelog
+
+### v0.5.0
+
+- Added `OCR_BOUNDING_BOXES` to return the position of each block in the page responses (see [Bounding boxes](#bounding-boxes)). Works with the `vl`, `text` and `structure` engines. Disabled by default.
+- Added `anthropic` as an `IMAGE_DESCRIPTION_PROVIDER`, for image descriptions with Claude models.
 
 ### v0.4.1
 

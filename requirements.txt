@@ -7,3 +7,4 @@ python-multipart
 python-magic
 psycopg[binary]
 openai>=1.55
+anthropic>=1.0

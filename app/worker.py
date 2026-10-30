@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import threading
@@ -20,6 +21,10 @@ if config.BACKEND == "postgres":
 
 RECONNECT_BACKOFF_START = 2.0
 RECONNECT_BACKOFF_MAX = 30.0
+
+
+def _pixel_box(coords):
+    return [int(round(float(v))) for v in coords]
 
 
 class OCRWorker:
@@ -198,16 +203,16 @@ class OCRWorker:
             )
         self._with_conn(op)
 
-    def _write_page(self, job_id, page_num, markdown):
+    def _write_page(self, job_id, page_num, markdown, bounding_boxes=None):
         now = time.time()
 
         def op(conn):
             conn.execute(
                 db._q(
-                    "INSERT INTO pages (job_id, page_num, markdown, created_at) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (job_id, page_num) DO NOTHING"
+                    "INSERT INTO pages (job_id, page_num, markdown, bounding_boxes, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT (job_id, page_num) DO NOTHING"
                 ),
-                (job_id, page_num, markdown, now),
+                (job_id, page_num, markdown, bounding_boxes, now),
             )
             row = conn.execute(
                 db._q(
@@ -333,13 +338,19 @@ class OCRWorker:
                 tmp_path = tmp.name
 
             try:
-                result = ocr.predict(input=tmp_path)
+                result = list(ocr.predict(input=tmp_path))
                 if config.OCR_ENGINE == "text":
                     page_markdown = self._text_lines(result)
                 else:
                     page_markdown = self._markdown_text(result, page_num, job_id)
+                bounding_boxes = None
+                if config.BOUNDING_BOXES:
+                    bounding_boxes = json.dumps(
+                        self._bounding_boxes(result, pil_image.size, config.DPI if is_pdf else None),
+                        ensure_ascii=False,
+                    )
 
-                cancel_requested = self._write_page(job_id, page_num, page_markdown)
+                cancel_requested = self._write_page(job_id, page_num, page_markdown, bounding_boxes)
                 print(f"[{job_id[:8]}] Page {page_num}/{total_pages} done")
 
                 if cancel_requested:
@@ -398,3 +409,27 @@ class OCRWorker:
             if lines:
                 parts.append("\n".join(lines))
         return "\n\n".join(parts)
+
+    def _bounding_boxes(self, result, size, dpi):
+        width, height = size
+        blocks = []
+        for res in result:
+            if config.OCR_ENGINE == "text":
+                texts = res.get("rec_texts")
+                boxes = res.get("rec_boxes")
+                scores = res.get("rec_scores")
+                if texts is None or boxes is None:
+                    continue
+                for i, text in enumerate(texts):
+                    block = {"label": "text_line", "bbox": _pixel_box(boxes[i]), "content": text}
+                    if scores is not None:
+                        block["score"] = round(float(scores[i]), 4)
+                    blocks.append(block)
+            else:
+                for block in res.get("parsing_res_list") or []:
+                    blocks.append({
+                        "label": block.label,
+                        "bbox": _pixel_box(block.bbox),
+                        "content": block.content,
+                    })
+        return {"width": width, "height": height, "dpi": dpi, "blocks": blocks}

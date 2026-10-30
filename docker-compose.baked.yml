@@ -10,13 +10,15 @@ services:
     #   - API_KEY="your-secret-key"
     #   # Database backend (optional - SQLite by default when DATABASE_URL is unset)
     #   - DATABASE_URL=postgresql://user:password@host:5432/ocr
-    #   # Run mode (optional - server by default; job drains the queue then exits)
+    #   # Run mode (optional - server by default; job reads one file from stdin, processes it, and exits)
     #   - RUN_MODE=server                             # server | job
     #   # Markdown labels dropped from output (optional - default drops headers/footers/page numbers; remove header,footer to keep them). Applies to vl and structure engines.
     #   - OCR_MARKDOWN_IGNORE_LABELS=number,footnote,header,header_image,footer,footer_image,aside_text
+    #   # Bounding boxes (optional - off by default). Page responses gain a bounding_boxes object: page size and every block's label, pixel box and text.
+    #   - OCR_BOUNDING_BOXES=true
     #   # Image description (optional - disabled by default)
     #   - IMAGE_DESCRIPTION_ENABLED=true
-    #   - IMAGE_DESCRIPTION_PROVIDER=azure            # openai | azure
+    #   - IMAGE_DESCRIPTION_PROVIDER=azure            # openai | azure | anthropic
     #   - IMAGE_DESCRIPTION_API_URL="https://<your-resource>.cognitiveservices.azure.com"
     #   - IMAGE_DESCRIPTION_API_VERSION="2025-04-01-preview"
     #   - IMAGE_DESCRIPTION_API_MODE=responses        # chat_completions | responses
@@ -32,9 +34,9 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
-    # Job mode drains the queue once and exits. Run it as a one-off so the restart
-    # policy above does not relaunch it after a clean exit:
-    #   docker compose -f docker-compose.baked.yml run --rm -e RUN_MODE=job paddleocr
+    # Job mode reads one file from stdin, processes it, and exits. Run it as a one-off
+    # so the restart policy above does not relaunch it after a clean exit:
+    #   docker compose -f docker-compose.baked.yml run --rm -T -e RUN_MODE=job paddleocr < document.pdf
     # On SQLite, run job mode only when no server container is using the same volume.
 
   # Structure engine (GPU):

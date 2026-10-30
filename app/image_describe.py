@@ -19,6 +19,14 @@ _vision_client_lock = threading.Lock()
 
 
 def _build_vision_client():
+    if config.IMAGE_DESCRIPTION_PROVIDER == "anthropic":
+        from anthropic import Anthropic
+
+        return Anthropic(
+            api_key=config.IMAGE_DESCRIPTION_API_KEY or "none",
+            timeout=config.IMAGE_DESCRIPTION_TIMEOUT,
+        )
+
     from openai import AzureOpenAI, OpenAI
 
     if config.IMAGE_DESCRIPTION_PROVIDER == "azure":
@@ -71,6 +79,20 @@ def _encode_image(pil_image) -> str:
 
 
 def _vision_call(client, data_url: str, prompt: str) -> str:
+    if config.IMAGE_DESCRIPTION_PROVIDER == "anthropic":
+        resp = client.messages.create(
+            model=config.IMAGE_DESCRIPTION_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": data_url.split(",", 1)[1],
+                }},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        if resp.stop_reason == "refusal":
+            raise RuntimeError("model refused the request")
+        return "".join(block.text for block in resp.content if block.type == "text").strip()
     if config.IMAGE_DESCRIPTION_API_MODE == "responses":
         resp = client.responses.create(
             model=config.IMAGE_DESCRIPTION_MODEL,
